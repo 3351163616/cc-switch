@@ -40,7 +40,22 @@ struct GeminiTokens {
 pub fn sync_gemini_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     let gemini_dir = get_gemini_dir();
 
-    let files = collect_gemini_session_files(&gemini_dir);
+    // (path, 预取 mtime)。宿主侧传 None — 自己 stat；WSL 侧由 find 一并取回，
+    // 不必再走一次 9P stat。
+    let mut files: Vec<(PathBuf, Option<i64>)> = collect_gemini_session_files(&gemini_dir)
+        .into_iter()
+        .map(|p| (p, None))
+        .collect();
+
+    // 仅 Windows 有数据，其他平台 collect_files 恒为空
+    {
+        use crate::services::wsl_sessions::{collect_files, WslTool};
+        files.extend(
+            collect_files(WslTool::Gemini)
+                .into_iter()
+                .map(|f| (f.unc_path, Some(f.modified_nanos))),
+        );
+    }
 
     let mut result = SessionSyncResult {
         imported: 0,
@@ -55,8 +70,8 @@ pub fn sync_gemini_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
         return Ok(result);
     }
 
-    for file_path in &files {
-        match sync_single_gemini_file(db, file_path) {
+    for (file_path, known_modified) in &files {
+        match sync_single_gemini_file(db, file_path, *known_modified) {
             Ok((imported, skipped)) => {
                 result.imported += imported;
                 result.skipped += skipped;
@@ -124,13 +139,22 @@ fn collect_gemini_session_files(gemini_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// 同步单个 Gemini 会话 JSON 文件，返回 (imported, skipped)
-fn sync_single_gemini_file(db: &Database, file_path: &Path) -> Result<(u32, u32), AppError> {
+fn sync_single_gemini_file(
+    db: &Database,
+    file_path: &Path,
+    known_modified: Option<i64>,
+) -> Result<(u32, u32), AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    // 获取文件元数据
-    let metadata = fs::metadata(file_path)
-        .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
-    let file_modified = metadata_modified_nanos(&metadata);
+    // 宿主侧 None：自己 stat；WSL 侧由 find 一并取回 mtime，避免 9P stat
+    let file_modified = match known_modified {
+        Some(nanos) => nanos,
+        None => {
+            let metadata = fs::metadata(file_path)
+                .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
+            metadata_modified_nanos(&metadata)
+        }
+    };
 
     // 检查同步状态
     let (last_modified, _last_offset) = get_sync_state(db, &file_path_str)?;

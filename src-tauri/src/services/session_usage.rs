@@ -131,42 +131,45 @@ struct ParsedAssistantUsage {
 
 /// 同步 Claude Code 会话日志到使用统计数据库
 pub fn sync_claude_session_logs(db: &Database) -> Result<SessionSyncResult, AppError> {
+    let mut result = SessionSyncResult::default();
+
+    // 1) 宿主 ~/.claude/projects
     let projects_dir = get_claude_config_dir().join("projects");
-    if !projects_dir.exists() {
-        return Ok(SessionSyncResult {
-            imported: 0,
-            skipped: 0,
-            files_scanned: 0,
-            suspected_duplicates: 0,
-            deferred_files: 0,
-            errors: vec![],
-        });
+    if projects_dir.exists() {
+        let jsonl_files = collect_jsonl_files(&projects_dir);
+        result.files_scanned += jsonl_files.len() as u32;
+
+        for file_path in &jsonl_files {
+            match sync_single_file(db, file_path) {
+                Ok((imported, skipped)) => {
+                    result.imported += imported;
+                    result.skipped += skipped;
+                }
+                Err(e) => {
+                    let msg = format!("{}: {e}", file_path.display());
+                    log::warn!("[SESSION-SYNC] 文件解析失败: {msg}");
+                    result.errors.push(msg);
+                }
+            }
+        }
     }
 
-    let mut result = SessionSyncResult {
-        imported: 0,
-        skipped: 0,
-        files_scanned: 0,
-        suspected_duplicates: 0,
-        deferred_files: 0,
-        errors: vec![],
-    };
-
-    // 收集所有 .jsonl 文件
-    let jsonl_files = collect_jsonl_files(&projects_dir);
-
-    for file_path in &jsonl_files {
-        result.files_scanned += 1;
-
-        match sync_single_file(db, file_path) {
-            Ok((imported, skipped)) => {
-                result.imported += imported;
-                result.skipped += skipped;
-            }
-            Err(e) => {
-                let msg = format!("{}: {e}", file_path.display());
-                log::warn!("[SESSION-SYNC] 文件解析失败: {msg}");
-                result.errors.push(msg);
+    // 2) WSL 发行版内（仅 Windows 有数据，其他平台 collect_files 恒为空）
+    {
+        use crate::services::wsl_sessions::{collect_files, WslTool};
+        for wsl_file in collect_files(WslTool::Claude) {
+            result.files_scanned += 1;
+            match sync_single_file_with_mtime(db, &wsl_file.unc_path, Some(wsl_file.modified_nanos))
+            {
+                Ok((imported, skipped)) => {
+                    result.imported += imported;
+                    result.skipped += skipped;
+                }
+                Err(e) => {
+                    let msg = format!("{}: {e}", wsl_file.unc_path.display());
+                    log::warn!("[SESSION-SYNC] WSL 文件解析失败: {msg}");
+                    result.errors.push(msg);
+                }
             }
         }
     }
@@ -256,12 +259,29 @@ fn push_jsonl_children(dir: &Path, files: &mut Vec<PathBuf>) {
 
 /// 同步单个 JSONL 文件，返回 (imported, skipped)
 fn sync_single_file(db: &Database, file_path: &Path) -> Result<(u32, u32), AppError> {
+    sync_single_file_with_mtime(db, file_path, None)
+}
+
+/// [`sync_single_file`] 的核心实现。
+///
+/// `known_modified` 让调用方传入已经拿到的 mtime：WSL 的 `find` 枚举一次就把
+/// 全部路径和 mtime 取回来了，再对每个文件走一次 9P `stat` 会把「稳态零开销」
+/// 的设计整个抵消掉。传 `None` 时按老路径自己 stat。
+fn sync_single_file_with_mtime(
+    db: &Database,
+    file_path: &Path,
+    known_modified: Option<i64>,
+) -> Result<(u32, u32), AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    // 获取文件元数据
-    let metadata = fs::metadata(file_path)
-        .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
-    let file_modified = metadata_modified_nanos(&metadata);
+    let file_modified = match known_modified {
+        Some(nanos) => nanos,
+        None => {
+            let metadata = fs::metadata(file_path)
+                .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
+            metadata_modified_nanos(&metadata)
+        }
+    };
 
     // 检查同步状态
     let (last_modified, last_offset) = get_sync_state(db, &file_path_str)?;
