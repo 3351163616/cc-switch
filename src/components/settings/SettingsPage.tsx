@@ -515,6 +515,10 @@ export function SettingsPage({
                   onRefreshIntervalChange={(usageDashboardRefreshIntervalMs) =>
                     handleAutoSave({ usageDashboardRefreshIntervalMs })
                   }
+                  enableWslUsageSync={settings?.enableWslUsageSync ?? false}
+                  onEnableWslUsageSyncChange={(enableWslUsageSync) =>
+                    handleAutoSave({ enableWslUsageSync })
+                  }
                 />
               </TabsContent>
             </div>

@@ -362,6 +362,10 @@ export interface Settings {
   proxyConfirmed?: boolean;
   // User has confirmed the usage query first-run notice
   usageConfirmed?: boolean;
+  // 是否从 WSL 发行版同步用量统计（仅 Windows，默认关闭）
+  enableWslUsageSync?: boolean;
+  // User has confirmed the WSL usage sync prompt（未询问时为空）
+  wslUsagePromptConfirmed?: boolean;
   usageDashboardRefreshIntervalMs?: number;
   // Whether to show the failover toggle independently on the main page
   enableFailoverToggle?: boolean;
