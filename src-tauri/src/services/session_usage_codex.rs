@@ -397,6 +397,26 @@ fn thread_id_from_filename(path: &Path) -> Option<String> {
         .map(|value| value.hyphenated().to_string())
 }
 
+/// 双段文件名（`rollout-…-<threadId>_<sessionId>.jsonl`）里下划线**前**的
+/// 线程本体 UUID；单段文件名返回 `None`。
+///
+/// Codex 恢复（resume）一个线程时会新建这种双段 rollout：文件名末段是新会话
+/// ID，但文件内 root meta 的 `id` 仍是原线程 ID（续写信息在 `history_base`）。
+/// 「文件名 ID 与 meta ID 一致性」校验必须同时接受两个 UUID，否则恢复会话
+/// 会被永久 deferred，其后的全部用量静默丢失。
+fn leading_thread_id_from_filename(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let len = stem.len();
+    // 布局尾部：…<uuidA>_<uuidB>。uuidB 占 36 字符，其前是 '_'（共 37）
+    if !stem.get(len.checked_sub(37)?..)?.starts_with('_') {
+        return None;
+    }
+    let candidate = stem.get(len.checked_sub(73)?..len.checked_sub(37)?)?;
+    uuid::Uuid::parse_str(candidate)
+        .ok()
+        .map(|value| value.hyphenated().to_string())
+}
+
 fn explicit_parent_from_meta(payload: &serde_json::Value) -> ParentResolution {
     let forked_from = non_empty_string(payload.get("forked_from_id"));
     let spawned_from = payload
@@ -843,7 +863,12 @@ fn parse_codex_file(
                         .or_else(|| payload.get("threadId")),
                 );
                 if let (Some(filename_id), Some(meta_id)) = (&root_thread_id, meta_thread_id) {
-                    if filename_id != &meta_id {
+                    // 双段文件名（恢复会话）的 meta id 是下划线前的原线程 ID，
+                    // 两个 UUID 任一匹配即视为一致。
+                    let leading_id = leading_thread_id_from_filename(file_path);
+                    let matches =
+                        filename_id == &meta_id || leading_id.as_deref() == Some(meta_id.as_str());
+                    if !matches {
                         parent = ParentResolution::Deferred(format!(
                             "文件名线程 ID ({filename_id}) 与 root meta ID ({meta_id}) 不一致"
                         ));
@@ -1682,6 +1707,65 @@ mod tests {
             .collect::<Vec<_>>();
         let mut pass = CodexSyncPass::load(db)?;
         sync_single_codex_file(db, file, &build_rollout_index(&files), &mut pass, None)
+    }
+
+    /// 恢复（resume）会话的 rollout 文件名是 `<原线程ID>_<新会话ID>` 双 UUID，
+    /// 而 root meta 的 id 是**原线程 ID**（等于文件名第一个 UUID）。
+    /// 真实样本：rollout-2026-08-26T17-18-13-01a03d4c-...-47252_01a03d5c-...-9c7b8dd.jsonl
+    ///   payload.id = 01a03d4c-...（原线程），forked_from_id = null，
+    ///   续写信息在 history_base 里。
+    /// 旧的校验只认文件名**末尾** UUID，对这类文件必然判「不一致」→ 永久 deferred，
+    /// 用户恢复会话后的全部用量静默丢失（实测连续两天数据缺失）。
+    #[test]
+    fn test_resumed_rollout_meta_id_matching_leading_uuid_is_not_deferred() -> Result<(), AppError>
+    {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join(format!(
+            "rollout-2026-08-26T17-18-13-{PARENT_ID}_{CHILD_A_ID}.jsonl"
+        ));
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count_at(100, 50, 20, "2026-08-26T09:18:20Z"),
+            ],
+        );
+
+        // thread_id_from_filename 提取的是末尾 UUID（子会话 ID），保持现状：
+        // 它同时是 request_id 前缀，保证各分段文件的去重键不冲突。
+        let parsed = parse_codex_file(&file, thread_id_from_filename(&file))?;
+
+        // 恢复会话不是 fork：没有显式 parent，不应因 ID 不一致被拒。
+        assert!(
+            !matches!(parsed.parent, ParentResolution::Deferred(_)),
+            "恢复会话不应被 deferred，实际: {:?}",
+            parsed.parent
+        );
+        // request_id 前缀必须是文件名末尾的子会话 ID（各分段互相独立去重）
+        assert_eq!(parsed.root_thread_id.as_deref(), Some(CHILD_A_ID));
+        assert!(parsed.has_billable_tokens);
+        Ok(())
+    }
+
+    /// 单 UUID 文件名的既有校验必须保持：meta id 与文件名 ID 不一致仍要拒收。
+    #[test]
+    fn test_single_uuid_filename_meta_mismatch_still_deferred() -> Result<(), AppError> {
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        // meta 里写的是另一个线程的 ID —— 这不是恢复会话能解释的形态
+        write_jsonl(
+            &file,
+            &[
+                session_meta(CHILD_B_ID),
+                turn_context(),
+                token_count_at(1, 1, 1, "2026-07-10T03:00:02Z"),
+            ],
+        );
+
+        let parsed = parse_codex_file(&file, thread_id_from_filename(&file))?;
+        assert!(matches!(parsed.parent, ParentResolution::Deferred(_)));
+        Ok(())
     }
 
     #[test]
